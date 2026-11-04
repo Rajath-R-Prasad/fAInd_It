@@ -1,0 +1,80 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Production builds
+/dist
+/build
+/.next
+/out
+
+# Testing
+/coverage
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+build/
+develop-eggs/
+dist/
+downloads/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this.txt
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.pyvenv/
+virtualenv/
+
+# FastAPI
+uploads/
+static/uploads/
+
+# Database
+*.db
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Alembic
+alembic/versions/__pycache__/
