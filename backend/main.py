@@ -1,17 +1,20 @@
 """fAInd It - Backend API Application"""
 
+import glob
+import logging
 import os
 from datetime import datetime, timedelta
-from typing import List, Optional
-from functools import reduce
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, status
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import (
     create_engine,
+    inspect,
+    text,
     Column,
-    Integer,
     String,
     Boolean,
     DateTime,
@@ -29,30 +32,102 @@ from sqlalchemy.sql import func
 import uvicorn
 
 from passlib.context import CryptContext
+from pydantic import BaseModel, Field
 from jose import JWTError, jwt
 from uuid import UUID as PyUUID, uuid4
+from dotenv import load_dotenv
+
+from app.services.embedding_service import embed_image, embed_report_text
+from app.services.evaluation_service import (
+    EvaluationError,
+    evaluation_config,
+    load_latest_results,
+    run_evaluation,
+)
+from app.services.matching_service import SCORING_VERSION, rank_candidates
+from app.services.metadata_service import metadata_similarity
+
+load_dotenv()
+
+logger = logging.getLogger("faind-it")
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+if not os.path.isabs(UPLOAD_DIR):
+    UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_DIR)
+
+MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 
 
 # --- Database Configuration ---
 DATABASE_URL = os.getenv(
     "POSTGRES_DSN",
-    "postgresql://fainit_user:your_secure_password@localhost:5432/fainit"
+    os.getenv("DATABASE_URL", "postgresql://fainit_user:your_secure_password@localhost:5432/fainit")
 )
 
-database_url = make_url(DATABASE_URL)
-if database_url.drivername in {"postgres", "postgresql", "postgresql+psycopg"}:
-    database_url = database_url.set(drivername="postgresql+psycopg2")
+try:
+    database_url = make_url(DATABASE_URL)
+    if database_url.drivername in {
+        "postgres",
+        "postgresql",
+        "postgresql+psycopg2",
+    }:
+        database_url = database_url.set(drivername="postgresql+psycopg")
 
-engine = create_engine(
-    database_url,
-    pool_size=5,
-    max_overflow=10,
-    echo=False,
-)
+    engine = create_engine(
+        database_url,
+        pool_size=5,
+        max_overflow=10,
+        echo=False,
+    )
+except Exception as e:
+    print(f"Warning: DB config issue: {e}")
+    # Fallback to sqlite for local dev if postgres unavailable
+    engine = create_engine("sqlite:///./app.db", connect_args={"check_same_thread": False})
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def ensure_schema() -> None:
+    """Apply small additive schema upgrades for existing local databases.
+
+    This is a temporary bridge until Alembic migrations are added. New
+    databases are created correctly by Base.metadata.create_all().
+    """
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    columns = {
+        table: {column["name"] for column in inspector.get_columns(table)}
+        for table in tables
+    }
+
+    additions = [
+        ("users", "mobile_number", "VARCHAR(20)"),
+        ("reports", "updated_at", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("reports", "status", "VARCHAR(20) NOT NULL DEFAULT 'OPEN'"),
+        ("reports", "moderation_status", "VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'"),
+        ("claims", "message", "TEXT NOT NULL DEFAULT ''"),
+        ("claims", "updated_at", "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        ("claims", "reviewed_at", "TIMESTAMP"),
+    ]
+
+    for table, column, definition in additions:
+        if table not in tables or column in columns.get(table, set()):
+            continue
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                )
+            logger.info("Added missing column %s.%s", table, column)
+        except Exception:
+            logger.exception("Could not add column %s.%s", table, column)
 
 
 # --- SQLAlchemy Models ---
@@ -62,13 +137,18 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    mobile_number = Column(String(20), nullable=True)
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Boolean, default=True)
     is_superuser = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
 
     reports = relationship("Report", back_populates="owner")
-    claims = relationship("Claim", back_populates="claimant")
+    claims = relationship(
+        "Claim",
+        back_populates="claimant",
+        foreign_keys="Claim.claimant_id",
+    )
 
 
 class Report(Base):
@@ -83,6 +163,9 @@ class Report(Base):
     location = Column(String(500), nullable=True)
     event_date = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False
+    )
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     owner = relationship("User", back_populates="reports")
@@ -98,6 +181,10 @@ class Report(Base):
     final_score = Column(Float, nullable=True)
 
     is_active = Column(Boolean, default=True)
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN / MATCHED / CLOSED
+    moderation_status = Column(
+        String(20), nullable=False, default="ACTIVE"
+    )  # ACTIVE / FLAGGED / REMOVED
 
     __table_args__ = (
         Index("ix_reports_owner_id", "owner_id"),
@@ -116,7 +203,10 @@ class Report(Base):
             "location": self.location,
             "event_date": self.event_date.isoformat() if self.event_date else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
-            "image_url": f"/api/v1/uploads/{self.id}.jpg" if self.id else None,
+            "status": self.status or "OPEN",
+            "moderation_status": self.moderation_status or "ACTIVE",
+            "image_url": f"/uploads/{self.id}" if self.id else None,
+            "owner_id": str(self.owner_id) if self.owner_id else None,
         }
 
 
@@ -124,8 +214,15 @@ class Claim(Base):
     __tablename__ = "claims"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, nullable=False)
-    status = Column(String(20), nullable=False, default="pending")  # pending, accepted, rejected
+    status = Column(
+        String(20), nullable=False, default="PENDING"
+    )  # PENDING / ACCEPTED / REJECTED
+    message = Column(Text, nullable=False, default="")
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False
+    )
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     report_id = Column(UUID(as_uuid=True), ForeignKey("reports.id"), nullable=False)
     claimant_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
@@ -154,7 +251,9 @@ def create_access_token(subject: str, expires_delta: timedelta = None) -> str:
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.utcnow() + timedelta(
+            minutes=int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+        )
     to_encode = {"exp": expire, "sub": str(subject)}
     encoded = jwt.encode(to_encode, os.getenv("SECRET_KEY", "supersecretkeychangeverysecret"), algorithm=os.getenv("ALGORITHM", "HS256"))
     return encoded
@@ -202,6 +301,67 @@ def get_current_active_superuser(current_user: User = Depends(get_current_user))
     return current_user
 
 
+def find_report_image(report_id) -> Optional[str]:
+    """Return the stored image path for a report, if one exists."""
+    matches = sorted(glob.glob(os.path.join(UPLOAD_DIR, f"{report_id}.*")))
+    for path in matches:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _safe_extension(image: UploadFile) -> str:
+    suffix = os.path.splitext(image.filename or "")[1].lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        return ".jpg" if suffix == ".jpeg" else suffix
+    return ALLOWED_IMAGE_TYPES.get(image.content_type or "", ".jpg")
+
+
+def save_report_image(report_id, image: UploadFile, image_data: bytes) -> str:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    for old_path in glob.glob(os.path.join(UPLOAD_DIR, f"{report_id}.*")):
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+
+    image_path = os.path.join(UPLOAD_DIR, f"{report_id}{_safe_extension(image)}")
+    with open(image_path, "wb") as file_handle:
+        file_handle.write(image_data)
+    return image_path
+
+
+def generate_embeddings_for_report(report: Report) -> dict:
+    """Generate and assign embeddings, keeping the report if inference fails."""
+    result = {"image": "skipped", "text": "skipped", "errors": []}
+
+    image_path = find_report_image(report.id)
+    if image_path:
+        try:
+            report.image_embedding = embed_image(image_path)
+            result["image"] = "complete"
+        except Exception as exc:
+            logger.exception("Image embedding failed for report %s", report.id)
+            result["image"] = "failed"
+            result["errors"].append(f"image: {exc}")
+    else:
+        result["image"] = "missing"
+
+    try:
+        report.text_embedding = embed_report_text(report)
+        result["text"] = "complete"
+    except Exception as exc:
+        logger.exception("Text embedding failed for report %s", report.id)
+        result["text"] = "failed"
+        result["errors"].append(f"text: {exc}")
+
+    return result
+
+
+def public_embedding_status(result: dict) -> dict:
+    return {"image": result.get("image"), "text": result.get("text")}
+
+
 # --- FastAPI App ---
 
 app = FastAPI(
@@ -213,7 +373,13 @@ app = FastAPI(
 # CORS - restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("VITE_API_BASE_URL", "http://localhost:5173")],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "BACKEND_CORS_ORIGINS", "http://localhost:5173"
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -231,8 +397,9 @@ async def health_check():
 
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def register(
-    email: str,
-    password: str,
+    email: str = Form(...),
+    password: str = Form(...),
+    mobile_number: str = Form(...),
     db: Session = Depends(get_db),
 ):
     existing_user = db.query(User).filter(User.email == email).first()
@@ -242,12 +409,24 @@ def register(
             detail="Email already registered",
         )
 
+    mobile = mobile_number.strip()
+    digits = "".join(character for character in mobile if character.isdigit())
+    if not 7 <= len(digits) <= 15:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Enter a valid mobile number with 7 to 15 digits",
+        )
+
     hashed_password = get_password_hash(password)
-    user = User(email=email, hashed_password=hashed_password)
+    user = User(email=email, mobile_number=mobile, hashed_password=hashed_password)
     db.add(user)
     db.commit()
     db.refresh(user)
-    return {"id": str(user.id), "email": user.email}
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "mobile_number": user.mobile_number,
+    }
 
 
 @app.post("/auth/token", status_code=status.HTTP_200_OK)
@@ -262,21 +441,42 @@ def login(
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token = create_access_token(subject=str(user.id))
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "id": str(user.id),
+        "email": user.email,
+        "mobile_number": user.mobile_number,
+        "is_superuser": user.is_superuser,
+    }
+
+
+@app.get("/auth/me", status_code=status.HTTP_200_OK)
+def current_user_profile(current_user: User = Depends(get_current_user)):
+    return {
+        "id": str(current_user.id),
+        "email": current_user.email,
+        "mobile_number": current_user.mobile_number,
+        "is_active": current_user.is_active,
+        "is_superuser": current_user.is_superuser,
+        "created_at": current_user.created_at.isoformat()
+        if current_user.created_at
+        else None,
+    }
 
 
 # --- Report Routes ---
 
 @app.post("/reports/", status_code=status.HTTP_201_CREATED)
 async def create_report(
-    report_type: str,
-    title: str,
-    description: Optional[str],
-    category: Optional[str],
-    color: Optional[str],
-    location: Optional[str],
-    event_date: Optional[datetime],
+    report_type: str = Form(...),
+    title: str = Form(...),
+    description: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    event_date: Optional[datetime] = Form(None),
     image: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -287,18 +487,16 @@ async def create_report(
     image_data = await image.read()
     if not image_data:
         raise HTTPException(status_code=400, detail="Image file is empty")
+    if len(image_data) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image is too large. Maximum size is {MAX_UPLOAD_SIZE_MB} MB.",
+        )
 
-    allowed_types = ["image/jpeg", "image/png", "image/webp"]
-    if image.content_type not in allowed_types:
+    if image.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=400, detail="Invalid image type. Use JPEG, PNG, or WebP."
         )
-
-    upload_dir = "/app/backend/uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    image_path = f"{upload_dir}/{current_user.id}_{image.filename}"
-    with open(image_path, "wb") as f:
-        f.write(image_data)
 
     report = Report(
         type=report_type,
@@ -312,20 +510,17 @@ async def create_report(
     )
 
     db.add(report)
+    db.flush()
+
+    save_report_image(report.id, image, image_data)
+    embedding_result = generate_embeddings_for_report(report)
+
     db.commit()
     db.refresh(report)
 
-    return {
-        "id": str(report.id),
-        "type": report.type,
-        "title": report.title,
-        "description": report.description,
-        "category": report.category,
-        "color": report.color,
-        "location": report.location,
-        "event_date": report.event_date.isoformat() if report.event_date else None,
-        "image_url": f"/api/v1/uploads/{report.id}.jpg",
-    }
+    response = report.to_dict()
+    response["embedding_status"] = public_embedding_status(embedding_result)
+    return response
 
 
 @app.get("/reports/")
@@ -390,6 +585,8 @@ async def update_report(
         raise HTTPException(status_code=403, detail="Not authorized to update this report")
 
     if report_type:
+        if report_type not in ("LOST", "FOUND"):
+            raise HTTPException(status_code=400, detail="Report type must be LOST or FOUND")
         report.type = report_type
     if title is not None:
         report.title = title
@@ -408,18 +605,22 @@ async def update_report(
         image_data = await image.read()
         if not image_data:
             raise HTTPException(status_code=400, detail="Image file is empty")
-        allowed_types = ["image/jpeg", "image/png", "image/webp"]
-        if image.content_type not in allowed_types:
+        if len(image_data) > MAX_UPLOAD_SIZE_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image is too large. Maximum size is {MAX_UPLOAD_SIZE_MB} MB.",
+            )
+        if image.content_type not in ALLOWED_IMAGE_TYPES:
             raise HTTPException(status_code=400, detail="Invalid image type.")
-        upload_dir = "/app/backend/uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-        image_path = f"{upload_dir}/{current_user.id}_{image.filename}"
-        with open(image_path, "wb") as f:
-            f.write(image_data)
+        save_report_image(report.id, image, image_data)
+
+    embedding_result = generate_embeddings_for_report(report)
 
     db.commit()
     db.refresh(report)
-    return report.to_dict()
+    response = report.to_dict()
+    response["embedding_status"] = public_embedding_status(embedding_result)
+    return response
 
 
 @app.delete("/reports/{report_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -447,8 +648,6 @@ def find_matches(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    import numpy as np
-
     user_reports = db.query(Report).filter(
         Report.owner_id == current_user.id, Report.is_active == True
     ).all()
@@ -456,141 +655,248 @@ def find_matches(
     if not user_reports:
         return {"matches": [], "message": "No reports found for this user."}
 
-    matches = []
-
-    for user_report in user_reports:
-        opposite_reports = (
+    results = []
+    for source_report in user_reports:
+        candidates = (
             db.query(Report)
             .filter(
-                Report.type != user_report.type,
-                Report.owner_id != current_user.id,
+                Report.type != source_report.type,
                 Report.is_active == True,
+                Report.status == "OPEN",
+                Report.moderation_status == "ACTIVE",
             )
             .all()
         )
-
-        report_matches = []
-        for opp_report in opposite_reports:
-            # Image similarity (CLIP cosine similarity)
-            image_sim = 0.0
-            if user_report.image_embedding and opp_report.image_embedding:
-                u_emb = np.array(user_report.image_embedding, dtype=float)
-                o_emb = np.array(opp_report.image_embedding, dtype=float)
-                if np.linalg.norm(u_emb) > 0 and np.linalg.norm(o_emb) > 0:
-                    image_sim = float(
-                        np.dot(u_emb / np.linalg.norm(u_emb), o_emb / np.linalg.norm(o_emb))
-                    )
-
-            # Text similarity (Sentence-Transformer cosine similarity)
-            text_sim = 0.0
-            if user_report.text_embedding and opp_report.text_embedding:
-                u_emb = np.array(user_report.text_embedding, dtype=float)
-                o_emb = np.array(opp_report.text_embedding, dtype=float)
-                if np.linalg.norm(u_emb) > 0 and np.linalg.norm(o_emb) > 0:
-                    text_sim = float(
-                        np.dot(u_emb / np.linalg.norm(u_emb), o_emb / np.linalg.norm(o_emb))
-                    )
-
-            # Metadata similarity
-            metadata_sim = calculate_metadata_similarity(user_report, opp_report)
-
-            # Final fused score (weighted average)
-            final_score = round(
-                0.4 * image_sim + 0.3 * text_sim + 0.3 * metadata_sim, 4
-            )
-
-            report_matches.append(
-                {
-                    "report_id": str(opp_report.id),
-                    "report": {
-                        "id": str(opp_report.id),
-                        "type": opp_report.type,
-                        "title": opp_report.title,
-                        "description": opp_report.description,
-                        "category": opp_report.category,
-                        "color": opp_report.color,
-                        "location": opp_report.location,
-                        "event_date": opp_report.event_date.isoformat() if opp_report.event_date else None,
-                        "image_url": f"/api/v1/uploads/{opp_report.id}.jpg" if opp_report.id else None,
-                    },
-                    "scores": {
-                        "image_similarity": round(image_sim, 4),
-                        "text_similarity": round(text_sim, 4),
-                        "metadata_similarity": round(metadata_sim, 4),
-                        "final_score": final_score,
-                    },
-                }
-            )
-
-        # Sort by final_score descending and take top 5
-        report_matches.sort(key=lambda x: x["scores"]["final_score"], reverse=True)
-        matches.append(
+        ranked = rank_candidates(source_report, candidates, top_k=5, viewer_id=current_user.id)
+        results.append(
             {
-                "source_report_id": str(user_report.id),
-                "source_report": {
-                    "id": str(user_report.id),
-                    "type": user_report.type,
-                    "title": user_report.title,
-                },
-                "matches": report_matches[:5],
+                "source_report_id": str(source_report.id),
+                "source_report": source_report.to_dict(),
+                "matches": ranked,
             }
         )
 
-    return {"matches": matches}
+    return {"matches": results, "scoring_version": SCORING_VERSION}
+
+
+@app.get("/reports/{report_id}/matches", status_code=status.HTTP_200_OK)
+def get_report_matches(
+    report_id: PyUUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    source_report = db.query(Report).filter(Report.id == report_id).first()
+    if not source_report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if source_report.owner_id != current_user.id and not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized to view matches")
+
+    candidates = (
+        db.query(Report)
+        .filter(
+            Report.type != source_report.type,
+            Report.is_active == True,
+            Report.status == "OPEN",
+            Report.moderation_status == "ACTIVE",
+        )
+        .all()
+    )
+    ranked = rank_candidates(source_report, candidates, top_k=5, viewer_id=current_user.id)
+    return {
+        "source_report_id": str(source_report.id),
+        "source_report": source_report.to_dict(),
+        "matches": ranked,
+        "scoring_version": SCORING_VERSION,
+    }
+
+
+@app.post("/reports/{report_id}/matches/refresh", status_code=status.HTTP_200_OK)
+def refresh_report_matches(
+    report_id: PyUUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_report_matches(report_id=report_id, current_user=current_user, db=db)
+
+
+@app.post("/reports/{report_id}/retry-embeddings", status_code=status.HTTP_200_OK)
+def retry_report_embeddings(
+    report_id: PyUUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if report.owner_id != current_user.id and not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Not authorized to retry embeddings")
+
+    result = generate_embeddings_for_report(report)
+    db.commit()
+    db.refresh(report)
+    return {"report_id": str(report.id), "embedding_status": public_embedding_status(result)}
+
+
+@app.get("/uploads/{report_id}")
+def serve_report_image(
+    report_id: PyUUID,
+    db: Session = Depends(get_db),
+):
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    image_path = find_report_image(report_id)
+    if not image_path:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(image_path)
 
 
 def calculate_metadata_similarity(report1: Report, report2: Report) -> float:
-    """Calculate metadata similarity between two reports based on category, colour, location, and date."""
-    scores = []
-
-    # Category similarity
-    if report1.category and report2.category:
-        if report1.category.lower() == report2.category.lower():
-            scores.append(1.0)
-        else:
-            scores.append(0.0)
-    else:
-        scores.append(0.0)
-
-    # Colour similarity
-    if report1.color and report2.color:
-        if report1.color.lower() == report2.color.lower():
-            scores.append(1.0)
-        else:
-            scores.append(0.0)
-    else:
-        scores.append(0.0)
-
-    # Location similarity (simple string match; could be enhanced with geocoding)
-    if report1.location and report2.location:
-        if report1.location.lower() in report2.location.lower() or report2.location.lower() in report1.location.lower():
-            scores.append(1.0)
-        else:
-            scores.append(0.0)
-    else:
-        scores.append(0.0)
-
-    # Date similarity (within 7 days = high similarity, within 30 days = medium, else low)
-    if report1.event_date and report2.event_date:
-        delta = abs((report1.event_date - report2.event_date).days)
-        if delta <= 1:
-            scores.append(1.0)
-        elif delta <= 7:
-            scores.append(0.7)
-        elif delta <= 30:
-            scores.append(0.4)
-        else:
-            scores.append(0.1)
-    else:
-        scores.append(0.0)
-
-    # Average of all metadata similarity components
-    if scores:
-        return sum(scores) / len(scores)
-    return 0.0
+    """Backward-compatible wrapper around the metadata service."""
+    return metadata_similarity(report1, report2)
 
 
 # --- Claim Routes ---
+
+
+class ClaimCreateRequest(BaseModel):
+    found_report_id: PyUUID
+    message: str = Field(min_length=1, max_length=2000)
+
+
+def claim_to_dict(claim: Claim, viewer: Optional[User] = None) -> dict:
+    status = (claim.status or "PENDING").upper()
+    contact = None
+    if status == "ACCEPTED" and viewer is not None:
+        is_participant = viewer.id in {claim.claimant_id, claim.reported_owner_id}
+        if is_participant:
+            contact = {
+                "claimant_mobile": (
+                    claim.claimant.mobile_number if claim.claimant else None
+                ),
+                "owner_mobile": (
+                    claim.reported_owner.mobile_number
+                    if claim.reported_owner
+                    else None
+                ),
+            }
+
+    return {
+        "id": str(claim.id),
+        "status": status,
+        "message": claim.message or "",
+        "report_id": str(claim.report_id),
+        "claimant_id": str(claim.claimant_id),
+        "reported_owner_id": str(claim.reported_owner_id),
+        "created_at": claim.created_at.isoformat() if claim.created_at else None,
+        "updated_at": claim.updated_at.isoformat() if claim.updated_at else None,
+        "reviewed_at": claim.reviewed_at.isoformat() if claim.reviewed_at else None,
+        "report": claim.report.to_dict() if claim.report else None,
+        "contact": contact,
+    }
+
+
+def _pending_claim_query(db: Session, report_id, claimant_id):
+    return (
+        db.query(Claim)
+        .filter(
+            Claim.report_id == report_id,
+            Claim.claimant_id == claimant_id,
+            func.upper(Claim.status) == "PENDING",
+        )
+        .first()
+    )
+
+
+@app.post("/claims", status_code=status.HTTP_201_CREATED)
+def create_claim(
+    payload: ClaimCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    report = db.query(Report).filter(Report.id == payload.found_report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Found report not found")
+    if report.type != "FOUND":
+        raise HTTPException(status_code=400, detail="Claims can only target FOUND reports")
+    if report.owner_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot claim your own found report")
+    if (
+        not report.is_active
+        or report.status != "OPEN"
+        or report.moderation_status != "ACTIVE"
+    ):
+        raise HTTPException(status_code=400, detail="This report is not open for claims")
+
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="A verification message is required")
+
+    if _pending_claim_query(db, report.id, current_user.id):
+        raise HTTPException(
+            status_code=409, detail="You already have a pending claim for this report"
+        )
+
+    claim = Claim(
+        report_id=report.id,
+        claimant_id=current_user.id,
+        reported_owner_id=report.owner_id,
+        message=message,
+        status="PENDING",
+    )
+    db.add(claim)
+    db.commit()
+    db.refresh(claim)
+    return claim_to_dict(claim, current_user)
+
+
+@app.get("/claims/mine", status_code=status.HTTP_200_OK)
+def list_my_claims(
+    status: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Claim).filter(Claim.claimant_id == current_user.id)
+    if status:
+        query = query.filter(func.upper(Claim.status) == status.upper())
+    claims = query.order_by(Claim.created_at.desc()).all()
+    return [claim_to_dict(claim, current_user) for claim in claims]
+
+
+@app.get("/claims/received", status_code=status.HTTP_200_OK)
+def list_received_claims(
+    status: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Claim).filter(Claim.reported_owner_id == current_user.id)
+    if status:
+        query = query.filter(func.upper(Claim.status) == status.upper())
+    claims = query.order_by(Claim.created_at.desc()).all()
+    return [claim_to_dict(claim, current_user) for claim in claims]
+
+
+@app.get("/claims/{claim_id}", status_code=status.HTTP_200_OK)
+def get_claim(
+    claim_id: PyUUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    claim = db.query(Claim).filter(Claim.id == claim_id).first()
+    if not claim:
+        raise HTTPException(status_code=404, detail="Claim not found")
+
+    if (
+        claim.claimant_id != current_user.id
+        and claim.reported_owner_id != current_user.id
+        and not current_user.is_superuser
+    ):
+        raise HTTPException(status_code=403, detail="Not authorized to view this claim")
+
+    return claim_to_dict(claim, current_user)
+
 
 @app.post("/claims/{claim_id}/accept", status_code=status.HTTP_200_OK)
 def accept_claim(
@@ -603,18 +909,53 @@ def accept_claim(
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
 
-    # Check authorization: claimant or reported owner or admin
-    if claim.claimant_id != current_user.id and claim.reported_owner_id != current_user.id and not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Not authorized to accept this claim")
+    if claim.reported_owner_id != current_user.id and not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Only the found-report owner can accept")
 
-    if claim.status != "pending":
-        return {"message": "Claim is not in pending status"}
+    if (claim.status or "").upper() != "PENDING":
+        raise HTTPException(status_code=409, detail="Claim is not pending")
 
-    claim.status = "accepted"
+    existing_accepted = (
+        db.query(Claim)
+        .filter(
+            Claim.report_id == claim.report_id,
+            Claim.id != claim.id,
+            func.upper(Claim.status) == "ACCEPTED",
+        )
+        .first()
+    )
+    if existing_accepted:
+        raise HTTPException(
+            status_code=409, detail="Another claim for this report is already accepted"
+        )
 
-    db.commit()
+    try:
+        claim.status = "ACCEPTED"
+        claim.reviewed_at = func.now()
+
+        if claim.report:
+            claim.report.status = "MATCHED"
+
+        other_pending = (
+            db.query(Claim)
+            .filter(
+                Claim.report_id == claim.report_id,
+                Claim.id != claim.id,
+                func.upper(Claim.status) == "PENDING",
+            )
+            .all()
+        )
+        for other in other_pending:
+            other.status = "REJECTED"
+            other.reviewed_at = func.now()
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(claim)
-    return {"id": str(claim.id), "status": claim.status, "message": "Claim accepted"}
+    return claim_to_dict(claim, current_user)
 
 
 @app.post("/claims/{claim_id}/reject", status_code=status.HTTP_200_OK)
@@ -628,15 +969,17 @@ def reject_claim(
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
 
-    # Check authorization
-    if claim.claimant_id != current_user.id and claim.reported_owner_id != current_user.id and not current_user.is_superuser:
-        raise HTTPException(status_code=403, detail="Not authorized to reject this claim")
+    if claim.reported_owner_id != current_user.id and not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Only the found-report owner can reject")
 
-    claim.status = "rejected"
+    if (claim.status or "").upper() != "PENDING":
+        raise HTTPException(status_code=409, detail="Claim is not pending")
 
+    claim.status = "REJECTED"
+    claim.reviewed_at = func.now()
     db.commit()
     db.refresh(claim)
-    return {"id": str(claim.id), "status": claim.status, "message": "Claim rejected"}
+    return claim_to_dict(claim, current_user)
 
 
 @app.get("/claims/", status_code=status.HTTP_200_OK)
@@ -645,20 +988,17 @@ def list_claims(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List claims. Admin sees all; users see their own claims (as claimant or reported owner)."""
+    """Backward-compatible combined list of submitted and received claims."""
     query = db.query(Claim)
     if not current_user.is_superuser:
-        claims = [
-            c
-            for c in query.all()
-            if c.claimant_id == current_user.id or c.reported_owner_id == current_user.id
-        ]
-    else:
-        claims = query.all()
+        query = query.filter(
+            (Claim.claimant_id == current_user.id)
+            | (Claim.reported_owner_id == current_user.id)
+        )
     if status:
-        claims = [c for c in claims if c.status == status]
-
-    return [{"id": str(c.id), "status": c.status, "report_id": str(c.report_id)} for c in claims]
+        query = query.filter(func.upper(Claim.status) == status.upper())
+    claims = query.order_by(Claim.created_at.desc()).all()
+    return [claim_to_dict(claim, current_user) for claim in claims]
 
 
 # --- Admin Routes ---
@@ -667,18 +1007,27 @@ def list_claims(
 def admin_list_reports(
     report_type: Optional[str] = None,
     category: Optional[str] = None,
+    status: Optional[str] = None,
+    moderation_status: Optional[str] = None,
+    search: Optional[str] = None,
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_superuser),
 ):
     """Admin list and filter reports."""
-    query = db.query(Report).filter(Report.is_active == True)
+    query = db.query(Report)
     if report_type:
         query = query.filter(Report.type == report_type)
     if category:
         query = query.filter(Report.category == category)
-    reports = query.offset(skip).limit(limit).all()
+    if status:
+        query = query.filter(Report.status == status.upper())
+    if moderation_status:
+        query = query.filter(Report.moderation_status == moderation_status.upper())
+    if search:
+        query = query.filter(Report.title.ilike(f"%{search}%"))
+    reports = query.order_by(Report.created_at.desc()).offset(skip).limit(limit).all()
     return [report.to_dict() for report in reports]
 
 
@@ -692,9 +1041,9 @@ def admin_flag_report(
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    report.is_active = False  # Soft-remove / flag
+    report.moderation_status = "FLAGGED"
     db.commit()
-    return {"message": "Report flagged successfully"}
+    return {"message": "Report flagged successfully", "report": report.to_dict()}
 
 
 @app.post("/admin/reports/{report_id}/remove", status_code=status.HTTP_200_OK)
@@ -707,9 +1056,10 @@ def admin_remove_report(
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
+    report.moderation_status = "REMOVED"
     report.is_active = False
     db.commit()
-    return {"message": "Report removed successfully"}
+    return {"message": "Report removed successfully", "report": report.to_dict()}
 
 
 @app.get("/admin/claims", status_code=status.HTTP_200_OK)
@@ -721,38 +1071,74 @@ def admin_list_claims(
     """Admin list claims."""
     query = db.query(Claim)
     if status:
-        query = query.filter(Claim.status == status)
-    claims = query.all()
-    return [
-        {
-            "id": str(c.id),
-            "status": c.status,
-            "report_id": str(c.report_id),
-            "claimant_id": str(c.claimant_id),
-            "reported_owner_id": str(c.reported_owner_id),
-        }
-        for c in claims
-    ]
+        query = query.filter(func.upper(Claim.status) == status.upper())
+    claims = query.order_by(Claim.created_at.desc()).all()
+    return [claim_to_dict(claim, current_user) for claim in claims]
+
+
+def _evaluation_run_enabled() -> bool:
+    return os.getenv("EVALUATION_RUN_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 @app.get("/evaluation/summary", status_code=status.HTTP_200_OK)
-def evaluation_summary(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_superuser),
-):
-    """Return saved evaluation results."""
-    # Placeholder - would return stored evaluation results
-    return {"message": "Evaluation summary not yet available", "experiments_run": 0}
+def evaluation_summary(current_user: User = Depends(get_current_user)):
+    """Return saved evaluation results without exposing internal paths."""
+    config = evaluation_config()
+    can_run = bool(current_user.is_superuser and _evaluation_run_enabled())
+    try:
+        results = load_latest_results()
+    except EvaluationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not results:
+        return {
+            "available": False,
+            "can_run": can_run,
+            "message": "No evaluation has been run yet.",
+            "config": config,
+        }
+
+    return {
+        "available": True,
+        "can_run": can_run,
+        "config": config,
+        **results,
+    }
 
 
 @app.post("/evaluation/run", status_code=status.HTTP_200_OK)
 def evaluation_run(
-    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_superuser),
 ):
-    """Run evaluation script or trigger controlled evaluation."""
-    # Placeholder - evaluation execution
-    return {"message": "Evaluation triggered", "experiment_count": 0}
+    """Run the controlled, offline evaluation and save its results."""
+    if not _evaluation_run_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Evaluation execution is disabled on this server",
+        )
+
+    try:
+        results = run_evaluation()
+    except EvaluationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Evaluation run failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Evaluation failed. Check the backend logs for details.",
+        ) from exc
+
+    return {
+        "available": True,
+        "can_run": True,
+        "config": evaluation_config(),
+        **results,
+    }
 
 
 # --- Startup ---
@@ -760,7 +1146,11 @@ def evaluation_run(
 @app.on_event("startup")
 def startup():
     """Create database tables on startup."""
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+        ensure_schema()
+    except Exception as e:
+        print(f"Warning: Could not create tables on startup: {e}")
 
 
 if __name__ == "__main__":
