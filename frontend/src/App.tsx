@@ -10,6 +10,8 @@ import ReportForm from './pages/ReportForm'
 import Matches from './pages/Matches'
 import Claims from './pages/Claims'
 import AdminDashboard from './pages/AdminDashboard'
+import Evaluation from './pages/Evaluation'
+import ReportDetail from './pages/ReportDetail'
 
 const queryClient = new QueryClient()
 
@@ -17,17 +19,20 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <Router>
-        <div className="min-h-screen">
+        <div className="flex min-h-screen flex-col">
           <Navbar />
-          <main className="container mx-auto px-4 py-8">
+          <main className="relative flex-1 overflow-x-clip">
             <Routes>
               <Route path="/" element={<Home />} />
               <Route path="/login" element={<Login />} />
               <Route path="/register" element={<Register />} />
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/report/new" element={<ReportForm />} />
+              <Route path="/reports/:id" element={<ReportDetail />} />
+              <Route path="/reports/:id/edit" element={<ReportForm />} />
               <Route path="/matches" element={<Matches />} />
               <Route path="/claims" element={<Claims />} />
+              <Route path="/evaluation" element={<Evaluation />} />
               <Route path="/admin" element={<AdminDashboard />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

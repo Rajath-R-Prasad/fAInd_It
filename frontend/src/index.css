@@ -1,103 +1,95 @@
-/* neo-brutalist base styles */
-:root {
-  --primary-color: #e91e63;
-  --secondary-color: #ff9ffb;
-  --accent-color: #ff6b6b;
-  --text-color: #2d3436;
-  --bg-color: #f0f2f5;
-  --card-bg: #ffffff;
-  --border-color: #000000;
-  --shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-}
-
-/* Neo-brutalist body styles */
-body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background-color: var(--bg-color);
-  color: var(--text-color);
-  margin: 0;
-  min-height: 100vh;
-}
-
-/* Neo-brutalist containers */
-.container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem;
-}
-
-/* Neo-brutalist buttons */
-.btn {
-  display: inline-block;
-  padding: 12px 24px;
-  background-color: var(--primary-color);
-  color: white;
-  border: 2px solid var(--border-color);
-  border-radius: 0px;
-  font-weight: bold;
-  font-size: 1rem;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  text-decoration: none;
-  text-align: center;
-}
-
-.btn:hover {
-  background-color: var(--secondary-color);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow);
-}
-
-.btn:active {
-  transform: translateY(0);
-}
-
-.btn:focus-visible {
-  outline: 3px solid var(--accent-color);
-  outline-offset: 2px;
-}
-
-/* Neo-brutalist cards */
-.card {
-  background-color: var(--card-bg);
-  border: 3px solid var(--border-color);
-  border-radius: 0px;
-  padding: 2rem;
-  margin: 1rem 0;
-  box-shadow: var(--shadow);
-}
-
-/* Neo-brutalist headers */
-h1, h2, h3, h4, h5, h6 {
-  font-weight: bold;
-  color: var(--primary-color);
-  margin-top: 0;
-  padding-top: 0;
-}
-
-/* Neo-brutalist form inputs */
-input, select, textarea {
-  width: 100%;
-  padding: 12px;
-  border: 2px solid var(--border-color);
-  border-radius: 0px;
-  background-color: var(--card-bg);
-  color: var(--text-color);
-  font-size: 1rem;
-  margin-bottom: 1rem;
-}
-
-input:focus, select:focus, textarea:focus {
-  outline: none;
-  border-color: var(--primary-color);
-  box-shadow: 0 0 0 3px var(--secondary-color);
-}
-
-/* Link styles */
-a {
-  color: var(--primary-color);
-  text-decoration: underline;
-}
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --cream: #fff8ef;
+  --lime: #d7ff38;
+  --lavender: #b99aff;
+  --bubble: #ff83b5;
+  --ink: #111111;
+  --muted: #555555;
+  --lavender-soft: #f0e9ff;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply min-h-screen bg-cream font-body text-ink antialiased;
+    background-image: radial-gradient(rgba(17, 17, 17, 0.08) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply font-display;
+  }
+
+  ::selection {
+    @apply bg-lime text-ink;
+  }
+
+  a {
+    @apply text-ink;
+  }
+}
+
+@layer components {
+  .neo-card {
+    @apply rounded-lg border-[3px] border-ink bg-white shadow-neo;
+  }
+
+  .neo-input {
+    @apply w-full rounded-md border-[3px] border-ink bg-white px-4 py-3 font-body text-sm text-ink placeholder:text-muted/60 transition-shadow focus:outline-none focus:ring-4 focus:ring-lime/70 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .neo-label {
+    @apply mb-2 block font-display text-xs font-extrabold uppercase tracking-[0.16em] text-ink;
+  }
+
+  .neo-icon-box {
+    @apply inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-md border-[3px] border-ink bg-lime text-ink shadow-[4px_4px_0_#111111];
+  }
+
+  .neo-alert {
+    @apply rounded-md border-[3px] border-ink px-4 py-3 text-sm font-semibold shadow-[4px_4px_0_#111111];
+  }
+
+  .neo-table {
+    @apply w-full border-collapse overflow-hidden rounded-lg border-[3px] border-ink bg-white;
+  }
+
+  .neo-th {
+    @apply border-b-[3px] border-r-[3px] border-ink bg-lavender px-3 py-2 text-left font-display text-[11px] font-extrabold uppercase tracking-[0.14em] text-ink last:border-r-0;
+  }
+
+  .neo-td {
+    @apply border-b-2 border-r-2 border-ink/80 px-3 py-3 align-top text-sm text-ink last:border-r-0;
+  }
+
+  .neo-link {
+    @apply font-bold underline decoration-[3px] underline-offset-4 transition-colors hover:bg-lime;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
