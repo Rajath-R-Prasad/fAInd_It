@@ -38,7 +38,7 @@ dbms_project/
 │   └── requirements-dev.txt
 ├── frontend/
 │   └── src/                # React pages, components, tests
-├── datasets/evaluation/    # labelled smoke set, images, saved results
+├── datasets/evaluation/    # labelled smoke set and image fixtures
 ├── docs/                   # API, database, AI matching, evaluation docs
 ├── notebooks/              # experiment outlines
 ├── PRD.md
@@ -84,8 +84,10 @@ Edit `backend/.env` and set at least:
 POSTGRES_DSN=postgresql+psycopg://fainit_user:change-me@localhost:5432/fainit
 SECRET_KEY=replace-with-a-long-random-secret
 BACKEND_CORS_ORIGINS=http://localhost:5173
-UPLOAD_DIR=./uploads
 ```
+
+Report images are stored in PostgreSQL. `UPLOAD_DIR` is only used by the legacy migration
+script.
 
 URL-encode reserved characters in the password. For example, `Rajath@2010` becomes
 `Rajath%402010` in the DSN.
@@ -159,12 +161,12 @@ venv/bin/python scripts/verify_demo.py
 
 ```bash
 cd backend
-venv/bin/python -m app.services.evaluation_service
+venv/bin/python scripts/run_evaluation.py
 ```
 
-Results are saved to `datasets/evaluation/results/latest.json`, a timestamped JSON file, and
-`latest.csv`. The protected Evaluation page reads the saved summary. The included dataset is
-a small smoke/stress set, not a representative campus benchmark.
+Results are inserted into PostgreSQL `evaluation_runs`. The protected Evaluation page reads
+the newest run. The included dataset is a small smoke/stress set, not a representative
+campus benchmark.
 
 See [docs/EVALUATION.md](docs/EVALUATION.md) for the method, metrics, latest results, and
 limitations.
@@ -205,7 +207,7 @@ Current verification status:
 - No Alembic migrations yet; startup uses `create_all()` plus `ensure_schema()`.
 - Embeddings use `ARRAY(Float)` because pgvector is unavailable locally.
 - `backend/main.py` still contains models, auth, and routes in one module.
-- Legacy images uploaded before the `{report_id}.{ext}` convention may not be discoverable.
+- Legacy upload files must be imported once with `scripts/migrate_to_db_storage.py`.
 - No dedicated report-details page; claims are submitted from the matches page.
 - The admin route is backend-protected but has no frontend route guard for direct navigation.
 - TanStack Query, React Hook Form, and Zod are installed but not fully adopted.
