@@ -1,9 +1,7 @@
 """Verify clean schema creation and the full demo workflow against PostgreSQL."""
 
 import os
-import shutil
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -22,7 +20,6 @@ DSN = os.getenv(
 )
 PSYCOPG_DSN = DSN.replace("+psycopg", "")
 SCHEMA = f"verify_demo_{uuid.uuid4().hex[:8]}"
-UPLOAD_DIR = tempfile.mkdtemp(prefix="fainit_verify_")
 
 IMAGES = REPO_ROOT / "datasets" / "evaluation" / "images"
 LOST_IMAGE = IMAGES / "lost_water_bottle.webp"
@@ -98,6 +95,9 @@ def run_demo() -> None:
         lost = lost_response.json()
         assert lost["embedding_status"]["image"] == "complete", lost
         assert lost["embedding_status"]["text"] == "complete", lost
+        lost_image = client.get(f"/uploads/{lost['id']}")
+        assert lost_image.status_code == 200, lost_image.text
+        assert lost_image.headers["content-type"].startswith("image/"), lost_image.headers
 
         with FOUND_IMAGE.open("rb") as handle:
             found_response = client.post(
@@ -116,6 +116,8 @@ def run_demo() -> None:
             )
         assert found_response.status_code == 201, found_response.text
         found = found_response.json()
+        found_image = client.get(f"/uploads/{found['id']}")
+        assert found_image.status_code == 200, found_image.text
 
         matches = client.get(f"/reports/{lost['id']}/matches", headers=owner_headers)
         assert matches.status_code == 200, matches.text
@@ -171,6 +173,8 @@ def run_demo() -> None:
         print("health:", health.json()["status"])
         print("tables:", ", ".join(tables))
         print("report columns:", ", ".join(sorted(columns)))
+        print("report image table:", "report_images" in tables)
+        print("evaluation table:", "evaluation_runs" in tables)
         print("embedding columns:", embedding_types)
         print("match final score:", top["scores"]["final_score"])
         print("claim status:", accepted["status"])
@@ -183,7 +187,6 @@ def run_demo() -> None:
 def main() -> int:
     create_schema()
     os.environ["PGOPTIONS"] = f"-c search_path={SCHEMA}"
-    os.environ["UPLOAD_DIR"] = UPLOAD_DIR
     os.environ["POSTGRES_DSN"] = DSN
 
     try:
@@ -191,7 +194,6 @@ def main() -> int:
         return 0
     finally:
         drop_schema()
-        shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
 
 
 if __name__ == "__main__":

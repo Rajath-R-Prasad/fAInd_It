@@ -1,6 +1,5 @@
 """Reproducible offline evaluation for the four PRD matching experiments."""
 
-import csv
 import json
 import os
 import time
@@ -27,7 +26,6 @@ from .metadata_service import metadata_similarity
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATASET_PATH = REPO_ROOT / "datasets" / "evaluation" / "dataset.json"
-DEFAULT_RESULTS_DIR = REPO_ROOT / "datasets" / "evaluation" / "results"
 TOP_K = 5
 
 EXPERIMENTS = [
@@ -282,56 +280,7 @@ def _run_experiment(
     }
 
 
-def _save_results(result: dict, results_dir: Optional[str] = None) -> Path:
-    directory = _resolve_path(
-        results_dir or os.getenv("EVALUATION_RESULTS_DIR"),
-        DEFAULT_RESULTS_DIR,
-    )
-    directory.mkdir(parents=True, exist_ok=True)
-
-    latest_path = directory / "latest.json"
-    with latest_path.open("w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
-        handle.write("\n")
-
-    timestamp = result["run"]["run_at"].replace(":", "").replace("-", "")
-    timestamp_path = directory / f"evaluation-{timestamp}.json"
-    with timestamp_path.open("w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2)
-        handle.write("\n")
-
-    csv_path = directory / "latest.csv"
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "experiment",
-                "precision_at_5",
-                "recall_at_5",
-                "f1",
-                "mrr",
-                "average_retrieval_latency_ms",
-            ]
-        )
-        for experiment in result["experiments"]:
-            writer.writerow(
-                [
-                    experiment["name"],
-                    experiment["precision_at_5"],
-                    experiment["recall_at_5"],
-                    experiment["f1"],
-                    experiment["mrr"],
-                    experiment["average_retrieval_latency_ms"],
-                ]
-            )
-
-    return latest_path
-
-
-def run_evaluation(
-    dataset_path: Optional[str] = None,
-    results_dir: Optional[str] = None,
-) -> dict:
+def run_evaluation(dataset_path: Optional[str] = None) -> dict:
     dataset, path = load_dataset(dataset_path)
     image_cache, text_cache, embedding_latency_ms = _prepare_embeddings(dataset)
 
@@ -376,24 +325,7 @@ def run_evaluation(
         "experiments": experiments,
     }
 
-    _save_results(result, results_dir)
     return result
-
-
-def load_latest_results(results_dir: Optional[str] = None) -> Optional[dict]:
-    directory = _resolve_path(
-        results_dir or os.getenv("EVALUATION_RESULTS_DIR"),
-        DEFAULT_RESULTS_DIR,
-    )
-    latest_path = directory / "latest.json"
-    if not latest_path.exists():
-        return None
-
-    try:
-        with latest_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise EvaluationError(f"Could not read saved evaluation results: {exc}") from exc
 
 
 def _display_path(path: Path) -> str:
@@ -407,12 +339,9 @@ def evaluation_config() -> dict:
     dataset_path = _resolve_path(
         os.getenv("EVALUATION_DATASET_PATH"), DEFAULT_DATASET_PATH
     )
-    results_dir = _resolve_path(
-        os.getenv("EVALUATION_RESULTS_DIR"), DEFAULT_RESULTS_DIR
-    )
     return {
         "dataset_path": _display_path(dataset_path),
-        "results_dir": _display_path(results_dir),
+        "results_storage": "postgresql:evaluation_runs",
         "top_k": TOP_K,
         "experiments": EXPERIMENTS,
     }

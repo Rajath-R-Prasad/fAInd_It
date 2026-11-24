@@ -5,6 +5,7 @@ performed. Imports of torch/transformers/sentence-transformers are intentionally
 lazy so the API can start even when the ML stack is not installed.
 """
 
+import io
 import os
 import threading
 from typing import Optional
@@ -70,15 +71,12 @@ def get_text_model():
     return _text_model, _text_model_name, _device()
 
 
-def embed_image(image_path: str) -> list[float]:
-    """Generate a normalized CLIP image embedding for a local image file."""
+def _embed_pil_image(image) -> list[float]:
     import torch
-    from PIL import Image
 
     model, processor, _, device = get_clip_model()
-    with Image.open(image_path) as image:
-        rgb = image.convert("RGB")
-        inputs = processor(images=rgb, return_tensors="pt")
+    rgb = image.convert("RGB")
+    inputs = processor(images=rgb, return_tensors="pt")
     inputs = {key: value.to(device) for key, value in inputs.items()}
 
     with torch.inference_mode():
@@ -89,6 +87,22 @@ def embed_image(image_path: str) -> list[float]:
     if norm > 0:
         vector = vector / norm
     return vector.tolist()
+
+
+def embed_image(image_path: str) -> list[float]:
+    """Generate a normalized CLIP image embedding for a local image file."""
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        return _embed_pil_image(image)
+
+
+def embed_image_data(image_data: bytes) -> list[float]:
+    """Generate a normalized CLIP image embedding from stored image bytes."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_data)) as image:
+        return _embed_pil_image(image)
 
 
 def build_report_text(report) -> str:

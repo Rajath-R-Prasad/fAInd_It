@@ -1,14 +1,12 @@
 """fAInd It - Backend API Application"""
 
-import glob
 import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import (
     create_engine,
@@ -20,6 +18,9 @@ from sqlalchemy import (
     DateTime,
     Text,
     UUID,
+    Integer,
+    LargeBinary,
+    JSON,
     ForeignKey,
     Index,
     ARRAY,
@@ -37,11 +38,10 @@ from jose import JWTError, jwt
 from uuid import UUID as PyUUID, uuid4
 from dotenv import load_dotenv
 
-from app.services.embedding_service import embed_image, embed_report_text
+from app.services.embedding_service import embed_image_data, embed_report_text
 from app.services.evaluation_service import (
     EvaluationError,
     evaluation_config,
-    load_latest_results,
     run_evaluation,
 )
 from app.services.matching_service import SCORING_VERSION, rank_candidates
@@ -50,10 +50,6 @@ from app.services.metadata_service import metadata_similarity
 load_dotenv()
 
 logger = logging.getLogger("faind-it")
-
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
-if not os.path.isabs(UPLOAD_DIR):
-    UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), UPLOAD_DIR)
 
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
 ALLOWED_IMAGE_TYPES = {
@@ -169,6 +165,12 @@ class Report(Base):
 
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     owner = relationship("User", back_populates="reports")
+    image_record = relationship(
+        "ReportImage",
+        back_populates="report",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     image_embedding = Column("image_embedding", ARRAY(Float), nullable=True)
     text_embedding = Column("text_embedding", ARRAY(Float), nullable=True)
@@ -210,6 +212,24 @@ class Report(Base):
         }
 
 
+class ReportImage(Base):
+    __tablename__ = "report_images"
+
+    report_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("reports.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    content_type = Column(String(50), nullable=False)
+    image_data = Column(LargeBinary, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    report = relationship("Report", back_populates="image_record")
+
+
 class Claim(Base):
     __tablename__ = "claims"
 
@@ -231,6 +251,23 @@ class Claim(Base):
     report = relationship("Report", foreign_keys=[report_id])
     claimant = relationship("User", foreign_keys=[claimant_id])
     reported_owner = relationship("User", foreign_keys=[reported_owner_id])
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
+    run_at = Column(DateTime(timezone=True), nullable=True)
+    scoring_version = Column(String(50), nullable=True)
+    top_k = Column(Integer, nullable=True)
+    dataset_name = Column(String(255), nullable=True)
+    dataset_version = Column(String(50), nullable=True)
+    query_count = Column(Integer, nullable=True)
+    candidate_count = Column(Integer, nullable=True)
+    results = Column(JSON, nullable=False)
+
+    __table_args__ = (Index("ix_evaluation_runs_created_at", "created_at"),)
 
 
 # --- Authentication ---
@@ -301,44 +338,29 @@ def get_current_active_superuser(current_user: User = Depends(get_current_user))
     return current_user
 
 
-def find_report_image(report_id) -> Optional[str]:
-    """Return the stored image path for a report, if one exists."""
-    matches = sorted(glob.glob(os.path.join(UPLOAD_DIR, f"{report_id}.*")))
-    for path in matches:
-        if os.path.isfile(path):
-            return path
-    return None
+def save_report_image(db: Session, report: Report, image: UploadFile, image_data: bytes) -> None:
+    """Store or replace a report image directly in PostgreSQL."""
+    content_type = image.content_type or "application/octet-stream"
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid image type. Use JPEG, PNG, or WebP.")
 
+    record = report.image_record
+    if record is None:
+        record = ReportImage(report=report)
 
-def _safe_extension(image: UploadFile) -> str:
-    suffix = os.path.splitext(image.filename or "")[1].lower()
-    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
-        return ".jpg" if suffix == ".jpeg" else suffix
-    return ALLOWED_IMAGE_TYPES.get(image.content_type or "", ".jpg")
-
-
-def save_report_image(report_id, image: UploadFile, image_data: bytes) -> str:
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    for old_path in glob.glob(os.path.join(UPLOAD_DIR, f"{report_id}.*")):
-        try:
-            os.remove(old_path)
-        except OSError:
-            pass
-
-    image_path = os.path.join(UPLOAD_DIR, f"{report_id}{_safe_extension(image)}")
-    with open(image_path, "wb") as file_handle:
-        file_handle.write(image_data)
-    return image_path
+    record.content_type = content_type
+    record.image_data = image_data
+    db.add(record)
 
 
 def generate_embeddings_for_report(report: Report) -> dict:
     """Generate and assign embeddings, keeping the report if inference fails."""
     result = {"image": "skipped", "text": "skipped", "errors": []}
 
-    image_path = find_report_image(report.id)
-    if image_path:
+    image_record = report.image_record
+    if image_record and image_record.image_data:
         try:
-            report.image_embedding = embed_image(image_path)
+            report.image_embedding = embed_image_data(image_record.image_data)
             result["image"] = "complete"
         except Exception as exc:
             logger.exception("Image embedding failed for report %s", report.id)
@@ -512,7 +534,8 @@ async def create_report(
     db.add(report)
     db.flush()
 
-    save_report_image(report.id, image, image_data)
+    save_report_image(db, report, image, image_data)
+    db.flush()
     embedding_result = generate_embeddings_for_report(report)
 
     db.commit()
@@ -612,7 +635,8 @@ async def update_report(
             )
         if image.content_type not in ALLOWED_IMAGE_TYPES:
             raise HTTPException(status_code=400, detail="Invalid image type.")
-        save_report_image(report.id, image, image_data)
+        save_report_image(db, report, image, image_data)
+        db.flush()
 
     embedding_result = generate_embeddings_for_report(report)
 
@@ -746,11 +770,15 @@ def serve_report_image(
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    image_path = find_report_image(report_id)
-    if not image_path:
+    image = db.query(ReportImage).filter(ReportImage.report_id == report_id).first()
+    if not image:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    return FileResponse(image_path)
+    return Response(
+        content=image.image_data,
+        media_type=image.content_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 def calculate_metadata_similarity(report1: Report, report2: Report) -> float:
@@ -1085,17 +1113,43 @@ def _evaluation_run_enabled() -> bool:
     }
 
 
+def _evaluation_run_record(results: dict) -> EvaluationRun:
+    run = results.get("run") or {}
+    dataset = results.get("dataset") or {}
+    run_at = None
+    if run.get("run_at"):
+        try:
+            run_at = datetime.fromisoformat(run["run_at"])
+        except ValueError:
+            run_at = None
+
+    return EvaluationRun(
+        run_at=run_at,
+        scoring_version=run.get("scoring_version"),
+        top_k=run.get("top_k"),
+        dataset_name=dataset.get("name"),
+        dataset_version=dataset.get("version"),
+        query_count=dataset.get("query_count"),
+        candidate_count=dataset.get("candidate_count"),
+        results=results,
+    )
+
+
 @app.get("/evaluation/summary", status_code=status.HTTP_200_OK)
-def evaluation_summary(current_user: User = Depends(get_current_user)):
-    """Return saved evaluation results without exposing internal paths."""
+def evaluation_summary(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the latest saved evaluation run from PostgreSQL."""
     config = evaluation_config()
     can_run = bool(current_user.is_superuser and _evaluation_run_enabled())
-    try:
-        results = load_latest_results()
-    except EvaluationError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    latest = (
+        db.query(EvaluationRun)
+        .order_by(EvaluationRun.created_at.desc())
+        .first()
+    )
 
-    if not results:
+    if latest is None:
         return {
             "available": False,
             "can_run": can_run,
@@ -1107,15 +1161,44 @@ def evaluation_summary(current_user: User = Depends(get_current_user)):
         "available": True,
         "can_run": can_run,
         "config": config,
-        **results,
+        **(latest.results or {}),
     }
+
+
+@app.get("/evaluation/runs", status_code=status.HTTP_200_OK)
+def evaluation_runs(
+    current_user: User = Depends(get_current_active_superuser),
+    db: Session = Depends(get_db),
+):
+    """Return evaluation run history without the full per-query payload."""
+    runs = (
+        db.query(EvaluationRun)
+        .order_by(EvaluationRun.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        {
+            "id": str(run.id),
+            "created_at": run.created_at.isoformat() if run.created_at else None,
+            "run_at": run.run_at.isoformat() if run.run_at else None,
+            "scoring_version": run.scoring_version,
+            "top_k": run.top_k,
+            "dataset_name": run.dataset_name,
+            "dataset_version": run.dataset_version,
+            "query_count": run.query_count,
+            "candidate_count": run.candidate_count,
+        }
+        for run in runs
+    ]
 
 
 @app.post("/evaluation/run", status_code=status.HTTP_200_OK)
 def evaluation_run(
     current_user: User = Depends(get_current_active_superuser),
+    db: Session = Depends(get_db),
 ):
-    """Run the controlled, offline evaluation and save its results."""
+    """Run the controlled, offline evaluation and save its results to PostgreSQL."""
     if not _evaluation_run_enabled():
         raise HTTPException(
             status_code=403,
@@ -1132,6 +1215,10 @@ def evaluation_run(
             status_code=500,
             detail="Evaluation failed. Check the backend logs for details.",
         ) from exc
+
+    record = _evaluation_run_record(results)
+    db.add(record)
+    db.commit()
 
     return {
         "available": True,
